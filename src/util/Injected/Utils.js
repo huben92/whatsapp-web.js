@@ -981,21 +981,28 @@ exports.LoadUtils = () => {
 
         model.lastMessage = null;
         if (model.msgs && model.msgs.length) {
-            const lastMessage = chat.lastReceivedKey
-                ? window
-                      .require('WAWebCollections')
-                      .Msg.get(chat.lastReceivedKey._serialized) ||
-                  (
-                      await window
+            try {
+                const lastReceivedKeyId = chat.lastReceivedKey?._serialized;
+                const lastMessage = lastReceivedKeyId
+                    ? window
                           .require('WAWebCollections')
-                          .Msg.getMessagesById([
-                              chat.lastReceivedKey._serialized,
-                          ])
-                  )?.messages?.[0]
-                : null;
-            lastMessage &&
-                (model.lastMessage =
-                    window.WWebJS.getMessageModel(lastMessage));
+                          .Msg.get(lastReceivedKeyId) ||
+                      (
+                          await window
+                              .require('WAWebCollections')
+                              .Msg.getMessagesById([lastReceivedKeyId])
+                      )?.messages?.[0]
+                    : null;
+                lastMessage &&
+                    (model.lastMessage =
+                        window.WWebJS.getMessageModel(lastMessage));
+            } catch (ignoredError) {
+                // lastReceivedKey can point at a message that hasn't been
+                // hydrated locally yet (lazy-synced/archived chats), which
+                // makes the underlying IndexedDB lookup throw. Don't let one
+                // bad chat's lastMessage lookup fail the whole getChats() call.
+                model.lastMessage = null;
+            }
         }
 
         delete model.msgs;
