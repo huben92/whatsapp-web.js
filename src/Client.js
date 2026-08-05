@@ -1590,30 +1590,48 @@ class Client extends EventEmitter {
             );
         }
 
-        const sentMsg = await this.pupPage.evaluate(
-            async (chatId, content, options, sendSeen) => {
-                const chat = await window.WWebJS.getChat(chatId, {
-                    getAsModel: false,
-                });
+        const evaluateSendMessage = () =>
+            this.pupPage.evaluate(
+                async (chatId, content, options, sendSeen) => {
+                    const chat = await window.WWebJS.getChat(chatId, {
+                        getAsModel: false,
+                    });
 
-                if (!chat) return null;
+                    if (!chat) return null;
 
-                if (sendSeen) {
-                    await window.WWebJS.sendSeen(chatId);
-                }
+                    if (sendSeen) {
+                        await window.WWebJS.sendSeen(chatId);
+                    }
 
-                const msg = await window.WWebJS.sendMessage(
-                    chat,
-                    content,
-                    options,
-                );
-                return msg ? window.WWebJS.getMessageModel(msg) : undefined;
-            },
-            chatId,
-            content,
-            internalOptions,
-            sendSeen,
-        );
+                    const msg = await window.WWebJS.sendMessage(
+                        chat,
+                        content,
+                        options,
+                    );
+                    return msg ? window.WWebJS.getMessageModel(msg) : undefined;
+                },
+                chatId,
+                content,
+                internalOptions,
+                sendSeen,
+            );
+
+        let sentMsg;
+        try {
+            sentMsg = await evaluateSendMessage();
+        } catch (err) {
+            if (!/detached Frame/i.test(err?.message ?? '')) throw err;
+            // WhatsApp Web reloaded its page (e.g. on reconnect) exactly
+            // while this evaluate() was in flight, detaching the frame it
+            // targeted. Wait for the framenavigated handler's re-injection
+            // to finish, then retry once against the fresh frame.
+            await this.pupPage
+                .waitForFunction('typeof window.WWebJS !== "undefined"', {
+                    timeout: this.options.authTimeoutMs || 30000,
+                })
+                .catch(() => {});
+            sentMsg = await evaluateSendMessage();
+        }
 
         return sentMsg ? new Message(this, sentMsg) : undefined;
     }
