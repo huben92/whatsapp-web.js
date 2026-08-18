@@ -103,6 +103,8 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._appStateSyncPromise = null;
+        this._readyEmitted = false;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -153,7 +155,11 @@ class Client extends EventEmitter {
                         state,
                     };
                 },
-                { timeout: authTimeout, signal: abort.signal },
+                // Socket startup can legitimately exceed authTimeoutMs while
+                // history is syncing. Wait until it reaches an actionable
+                // state, but still cancel when a navigation supersedes this
+                // injection.
+                { timeout: 0, signal: abort.signal },
             );
             const needAuthentication = await needAuthHandle.jsonValue();
 
@@ -286,86 +292,6 @@ class Client extends EventEmitter {
                 },
             );
 
-            await exposeFunctionIfAbsent(
-                this.pupPage,
-                'onAppStateHasSyncedEvent',
-                async () => {
-                    const authEventPayload =
-                        await this.authStrategy.getAuthEventPayload();
-                    /**
-                     * Emitted when authentication is successful
-                     * @event Client#authenticated
-                     */
-                    this.emit(Events.AUTHENTICATED, authEventPayload);
-
-                    const injected = await this.pupPage.evaluate(async () => {
-                        return typeof window.WWebJS !== 'undefined';
-                    });
-
-                    if (!injected) {
-                        if (
-                            this.options.webVersionCache.type === 'local' &&
-                            this.currentIndexHtml
-                        ) {
-                            const { type: webCacheType, ...webCacheOptions } =
-                                this.options.webVersionCache;
-                            const webCache = WebCacheFactory.createWebCache(
-                                webCacheType,
-                                webCacheOptions,
-                            );
-
-                            await webCache.persist(
-                                this.currentIndexHtml,
-                                version,
-                            );
-                        }
-
-                        // Load util functions (serializers, helper functions)
-                        await this.pupPage.evaluate(LoadUtils);
-
-                        await this.pupPage
-                            .waitForFunction(
-                                'typeof window.WWebJS !== "undefined"',
-                                { timeout: 30000 },
-                            )
-                            .catch(() => {
-                                throw 'ready timeout';
-                            });
-
-                        /**
-                         * Current connection information
-                         * @type {ClientInfo}
-                         */
-                        this.info = new ClientInfo(
-                            this,
-                            await this.pupPage.evaluate(() => {
-                                return {
-                                    ...window
-                                        .require('WAWebConnModel')
-                                        .Conn.serialize(),
-                                    wid:
-                                        window
-                                            .require('WAWebUserPrefsMeUser')
-                                            .getMaybeMePnUser() ||
-                                        window
-                                            .require('WAWebUserPrefsMeUser')
-                                            .getMaybeMeLidUser(),
-                                };
-                            }),
-                        );
-
-                        this.interface = new InterfaceController(this);
-
-                        await this.attachEventListeners();
-                    }
-                    /**
-                     * Emitted when the client has initialized and is ready to receive messages.
-                     * @event Client#ready
-                     */
-                    this.emit(Events.READY);
-                    this.authStrategy.afterAuthReady();
-                },
-            );
             let lastPercent = null;
             await exposeFunctionIfAbsent(
                 this.pupPage,
@@ -397,13 +323,6 @@ class Client extends EventEmitter {
                         'change:state',
                         (_AppState, state) => {
                             window.onAuthAppStateChangedEvent(state);
-                        },
-                    ],
-                    [
-                        Socket,
-                        'change:hasSynced',
-                        () => {
-                            window.onAppStateHasSyncedEvent();
                         },
                     ],
                     [
@@ -444,21 +363,117 @@ class Client extends EventEmitter {
                     obj.on(event, handler);
                 }
                 window._wwjsListeners = listeners;
-
-                // Atomic hasSynced check in the same synchronous block as listener registration.
-                // If hasSynced is already true, Backbone won't fire change:hasSynced (no transition).
-                // If hasSynced is false, the listener above will catch the future transition.
-                const storeInjected = typeof window.WWebJS !== 'undefined';
-                if (Socket.hasSynced === true && !storeInjected) {
-                    window.onAppStateHasSyncedEvent();
-                }
             });
+
+            await this.pupPage.waitForFunction(
+                () =>
+                    window.require?.('WAWebSocketModel')?.Socket?.hasSynced ===
+                    true,
+                { timeout: 0, signal: abort.signal },
+            );
+            if (abort.signal.aborted) return;
+
+            // Run Node-side setup outside a Puppeteer exposed-function
+            // callback. Calling page.exposeFunction() recursively from such a
+            // callback can stall before all event bindings are installed.
+            await this._onAppStateHasSynced(version);
         } catch (err) {
             if (abort.signal.aborted) return; // superseded by newer inject
             throw err;
         } finally {
             if (this._injectAbort === abort) {
                 this._injectAbort = null;
+            }
+        }
+    }
+
+    async _onAppStateHasSynced(version) {
+        if (this._appStateSyncPromise) return this._appStateSyncPromise;
+
+        const syncPromise = (async () => {
+            if (!this._readyEmitted) {
+                const authEventPayload =
+                    await this.authStrategy.getAuthEventPayload();
+                /**
+                 * Emitted when authentication is successful
+                 * @event Client#authenticated
+                 */
+                this.emit(Events.AUTHENTICATED, authEventPayload);
+            }
+
+            const injected = await this.pupPage.evaluate(async () => {
+                return typeof window.WWebJS !== 'undefined';
+            });
+
+            if (!injected) {
+                if (
+                    this.options.webVersionCache.type === 'local' &&
+                    this.currentIndexHtml
+                ) {
+                    const { type: webCacheType, ...webCacheOptions } =
+                        this.options.webVersionCache;
+                    const webCache = WebCacheFactory.createWebCache(
+                        webCacheType,
+                        webCacheOptions,
+                    );
+
+                    await webCache.persist(this.currentIndexHtml, version);
+                }
+
+                // Load util functions (serializers, helper functions)
+                await this.pupPage.evaluate(LoadUtils);
+
+                await this.pupPage
+                    .waitForFunction('typeof window.WWebJS !== "undefined"', {
+                        timeout: 30000,
+                    })
+                    .catch(() => {
+                        throw 'ready timeout';
+                    });
+
+                /**
+                 * Current connection information
+                 * @type {ClientInfo}
+                 */
+                this.info = new ClientInfo(
+                    this,
+                    await this.pupPage.evaluate(() => {
+                        return {
+                            ...window
+                                .require('WAWebConnModel')
+                                .Conn.serialize(),
+                            wid:
+                                window
+                                    .require('WAWebUserPrefsMeUser')
+                                    .getMaybeMePnUser() ||
+                                window
+                                    .require('WAWebUserPrefsMeUser')
+                                    .getMaybeMeLidUser(),
+                        };
+                    }),
+                );
+
+                this.interface = new InterfaceController(this);
+                await this.attachEventListeners();
+            }
+
+            if (!this._readyEmitted) {
+                this._readyEmitted = true;
+                /**
+                 * Emitted when the client has initialized and is ready to receive messages.
+                 * @event Client#ready
+                 */
+                this.emit(Events.READY);
+                this.authStrategy.afterAuthReady();
+            }
+        })();
+
+        this._appStateSyncPromise = syncPromise;
+        try {
+            return await syncPromise;
+        } finally {
+            if (this._appStateSyncPromise === syncPromise) {
+                this._appStateSyncPromise = null;
             }
         }
     }
@@ -478,6 +493,8 @@ class Client extends EventEmitter {
 
         browser = null;
         page = null;
+        this._appStateSyncPromise = null;
+        this._readyEmitted = false;
 
         await this.authStrategy.beforeBrowserInitialized();
 
@@ -503,7 +520,15 @@ class Client extends EventEmitter {
                 ...puppeteerOpts,
                 args: browserArgs,
             });
-            page = (await browser.pages())[0];
+            const pages = await browser.pages();
+            page = pages[0] || (await browser.newPage());
+
+            // Chrome can restore multiple WhatsApp tabs after an unclean
+            // shutdown. They compete for the same LocalAuth session and can
+            // leave the controlled page stuck during startup.
+            await Promise.all(
+                pages.slice(1).map((openPage) => openPage.close()),
+            );
         }
 
         if (this.options.proxyAuthentication !== undefined) {
@@ -548,6 +573,8 @@ class Client extends EventEmitter {
                 frame.url().includes('post_logout=1') || this.lastLoggedOut;
 
             if (isLogout) {
+                this._appStateSyncPromise = null;
+                this._readyEmitted = false;
                 this.emit(Events.DISCONNECTED, 'LOGOUT');
                 await this.authStrategy.logout();
                 await this.authStrategy.beforeBrowserInitialized();

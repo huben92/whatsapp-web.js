@@ -17,7 +17,7 @@ describe('Client injection', function () {
             client.pupPage.waitForFunction.onSecondCall().callsFake(
                 (_predicate, options) =>
                     new Promise((_resolve, reject) => {
-                        resolve(options.signal);
+                        resolve(options);
                         options.signal.addEventListener(
                             'abort',
                             () => reject(options.signal.reason),
@@ -31,12 +31,45 @@ describe('Client injection', function () {
         sinon.stub(client, 'getWWebVersion').resolves('test-version');
 
         const injection = client.inject();
-        const signal = await socketWaitStarted;
+        const options = await socketWaitStarted;
 
-        expect(signal).to.be.an.instanceOf(AbortSignal);
-        signal.throwIfAborted();
+        expect(options.timeout).to.equal(0);
+        expect(options.signal).to.be.an.instanceOf(AbortSignal);
+        options.signal.throwIfAborted();
         client._injectAbort.abort();
 
         await injection;
+    });
+
+    it('deduplicates concurrent app-state synchronization', async function () {
+        const client = new Client();
+        let resolveAuthPayload;
+        const authPayload = new Promise((resolve) => {
+            resolveAuthPayload = resolve;
+        });
+
+        client.pupPage = {
+            evaluate: sinon.stub().resolves(true),
+        };
+        sinon
+            .stub(client.authStrategy, 'getAuthEventPayload')
+            .returns(authPayload);
+        const afterAuthReady = sinon.stub(
+            client.authStrategy,
+            'afterAuthReady',
+        );
+        const authenticated = sinon.spy();
+        const ready = sinon.spy();
+        client.on('authenticated', authenticated);
+        client.on('ready', ready);
+
+        const firstSync = client._onAppStateHasSynced('test-version');
+        const secondSync = client._onAppStateHasSynced('test-version');
+        resolveAuthPayload({});
+        await Promise.all([firstSync, secondSync]);
+
+        expect(authenticated.calledOnce).to.equal(true);
+        expect(ready.calledOnce).to.equal(true);
+        expect(afterAuthReady.calledOnce).to.equal(true);
     });
 });
