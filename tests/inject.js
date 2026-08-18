@@ -6,39 +6,31 @@ const { Client } = require('..');
 const expect = chai.expect;
 
 describe('Client injection', function () {
-    it('cancels the socket state wait when injection is superseded', async function () {
+    it('cancels socket state polling when injection is superseded', async function () {
         const client = new Client();
-        const socketWaitStarted = new Promise((resolve) => {
-            client.pupPage = {
-                waitForFunction: sinon.stub(),
-            };
-
-            client.pupPage.waitForFunction.onFirstCall().resolves();
-            client.pupPage.waitForFunction.onSecondCall().callsFake(
-                (_predicate, options) =>
-                    new Promise((_resolve, reject) => {
-                        resolve(options);
-                        options.signal.addEventListener(
-                            'abort',
-                            () => reject(options.signal.reason),
-                            { once: true },
-                        );
-                    }),
-            );
+        let socketPollStarted;
+        const pollStarted = new Promise((resolve) => {
+            socketPollStarted = resolve;
+        });
+        client.pupPage = {
+            evaluate: sinon.stub(),
+        };
+        client.pupPage.evaluate.onFirstCall().resolves(true);
+        client.pupPage.evaluate.onSecondCall().callsFake(() => {
+            socketPollStarted();
+            return null;
         });
 
         sinon.stub(client, 'setDeviceName').resolves();
         sinon.stub(client, 'getWWebVersion').resolves('test-version');
 
         const injection = client.inject();
-        const options = await socketWaitStarted;
+        await pollStarted;
 
-        expect(options.timeout).to.equal(0);
-        expect(options.signal).to.be.an.instanceOf(AbortSignal);
-        options.signal.throwIfAborted();
         client._injectAbort.abort();
 
         await injection;
+        expect(client.pupPage.evaluate.calledTwice).to.equal(true);
     });
 
     it('deduplicates concurrent app-state synchronization', async function () {

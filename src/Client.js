@@ -121,15 +121,15 @@ class Client extends EventEmitter {
 
         try {
             const authTimeout = this.options.authTimeoutMs || 30000;
-            await this.pupPage
-                .waitForFunction('window.Debug?.VERSION != undefined', {
-                    timeout: authTimeout,
-                    signal: abort.signal,
-                })
-                .catch((err) => {
-                    if (abort.signal.aborted) throw err;
-                    throw 'auth timeout';
-                });
+            const debugReady = await this._pollPage(
+                () => window.Debug?.VERSION != undefined,
+                abort.signal,
+                authTimeout,
+            );
+            if (!debugReady) {
+                if (abort.signal.aborted) return;
+                throw 'auth timeout';
+            }
             if (abort.signal.aborted) return;
             await this.setDeviceName(
                 this.options.deviceName,
@@ -138,30 +138,23 @@ class Client extends EventEmitter {
             const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
             const version = await this.getWWebVersion();
 
-            const needAuthHandle = await this.pupPage.waitForFunction(
-                () => {
-                    const state =
-                        window.require?.('WAWebSocketModel')?.Socket?.state;
-                    if (
-                        !state ||
-                        state === 'OPENING' ||
-                        state === 'UNLAUNCHED' ||
-                        state === 'PAIRING'
-                    ) {
-                        return false;
-                    }
-                    return {
-                        need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
-                        state,
-                    };
-                },
-                // Socket startup can legitimately exceed authTimeoutMs while
-                // history is syncing. Wait until it reaches an actionable
-                // state, but still cancel when a navigation supersedes this
-                // injection.
-                { timeout: 0, signal: abort.signal },
-            );
-            const needAuthentication = await needAuthHandle.jsonValue();
+            const needAuthentication = await this._pollPage(() => {
+                const state =
+                    window.require?.('WAWebSocketModel')?.Socket?.state;
+                if (
+                    !state ||
+                    state === 'OPENING' ||
+                    state === 'UNLAUNCHED' ||
+                    state === 'PAIRING'
+                ) {
+                    return false;
+                }
+                return {
+                    need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
+                    state,
+                };
+            }, abort.signal);
+            if (!needAuthentication) return;
 
             if (needAuthentication.need) {
                 const { failed, failureEventPayload, restart } =
@@ -365,11 +358,11 @@ class Client extends EventEmitter {
                 window._wwjsListeners = listeners;
             });
 
-            await this.pupPage.waitForFunction(
+            await this._pollPage(
                 () =>
                     window.require?.('WAWebSocketModel')?.Socket?.hasSynced ===
                     true,
-                { timeout: 0, signal: abort.signal },
+                abort.signal,
             );
             if (abort.signal.aborted) return;
 
@@ -384,6 +377,21 @@ class Client extends EventEmitter {
             if (this._injectAbort === abort) {
                 this._injectAbort = null;
             }
+        }
+    }
+
+    async _pollPage(condition, signal, timeout = 0) {
+        const deadline = timeout > 0 ? Date.now() + timeout : 0;
+
+        while (!signal.aborted) {
+            const result = await this.pupPage.evaluate(condition);
+            if (result) return result;
+
+            const remaining = deadline ? deadline - Date.now() : 500;
+            if (deadline && remaining <= 0) return;
+            await new Promise((resolve) =>
+                setTimeout(resolve, Math.min(500, remaining)),
+            );
         }
     }
 
