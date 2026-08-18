@@ -153,7 +153,7 @@ class Client extends EventEmitter {
                         state,
                     };
                 },
-                { timeout: authTimeout },
+                { timeout: authTimeout, signal: abort.signal },
             );
             const needAuthentication = await needAuthHandle.jsonValue();
 
