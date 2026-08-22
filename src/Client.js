@@ -36,6 +36,11 @@ const {
 const NoAuth = require('./authStrategies/NoAuth');
 const { exposeFunctionIfAbsent } = require('./util/Puppeteer');
 
+const isTransientNavigationError = (error) =>
+    /detached Frame|Execution context was destroyed|Cannot find context with specified id/i.test(
+        error?.message ?? '',
+    );
+
 /**
  * Starting point for interacting with the WhatsApp Web API
  * @extends {EventEmitter}
@@ -369,7 +374,7 @@ class Client extends EventEmitter {
             // Run Node-side setup outside a Puppeteer exposed-function
             // callback. Calling page.exposeFunction() recursively from such a
             // callback can stall before all event bindings are installed.
-            await this._onAppStateHasSynced(version);
+            await this._onAppStateHasSynced(version, abort.signal);
         } catch (err) {
             if (abort.signal.aborted) return; // superseded by newer inject
             throw err;
@@ -384,8 +389,19 @@ class Client extends EventEmitter {
         const deadline = timeout > 0 ? Date.now() + timeout : 0;
 
         while (!signal.aborted) {
-            const result = await this.pupPage.evaluate(condition);
-            if (result) return result;
+            try {
+                const result = await this.pupPage.evaluate(condition);
+                if (result) return result;
+            } catch (error) {
+                if (signal.aborted) return;
+                if (
+                    this.pupPage?.isClosed?.() ||
+                    this.pupBrowser?.isConnected?.() === false ||
+                    !isTransientNavigationError(error)
+                ) {
+                    throw error;
+                }
+            }
 
             const remaining = deadline ? deadline - Date.now() : 500;
             if (deadline && remaining <= 0) return;
@@ -395,13 +411,15 @@ class Client extends EventEmitter {
         }
     }
 
-    async _onAppStateHasSynced(version) {
+    async _onAppStateHasSynced(version, signal) {
         if (this._appStateSyncPromise) return this._appStateSyncPromise;
 
         const syncPromise = (async () => {
+            if (signal?.aborted) return;
             if (!this._readyEmitted) {
                 const authEventPayload =
                     await this.authStrategy.getAuthEventPayload();
+                if (signal?.aborted) return;
                 /**
                  * Emitted when authentication is successful
                  * @event Client#authenticated
@@ -412,6 +430,7 @@ class Client extends EventEmitter {
             const injected = await this.pupPage.evaluate(async () => {
                 return typeof window.WWebJS !== 'undefined';
             });
+            if (signal?.aborted) return;
 
             if (!injected) {
                 if (
@@ -430,14 +449,15 @@ class Client extends EventEmitter {
 
                 // Load util functions (serializers, helper functions)
                 await this.pupPage.evaluate(LoadUtils);
+                if (signal?.aborted) return;
 
-                await this.pupPage
-                    .waitForFunction('typeof window.WWebJS !== "undefined"', {
-                        timeout: 30000,
-                    })
-                    .catch(() => {
-                        throw 'ready timeout';
-                    });
+                const utilitiesReady = await this._pollPage(
+                    () => typeof window.WWebJS !== 'undefined',
+                    signal ?? new AbortController().signal,
+                    30000,
+                );
+                if (signal?.aborted) return;
+                if (!utilitiesReady) throw 'ready timeout';
 
                 /**
                  * Current connection information
@@ -463,6 +483,7 @@ class Client extends EventEmitter {
 
                 this.interface = new InterfaceController(this);
                 await this.attachEventListeners();
+                if (signal?.aborted) return;
             }
 
             if (!this._readyEmitted) {
@@ -577,12 +598,17 @@ class Client extends EventEmitter {
         this.pupPage.on('framenavigated', async (frame) => {
             if (frame.parentFrame() !== null) return;
 
+            const wasReady = this._readyEmitted;
+            this._appStateSyncPromise = null;
+            this._readyEmitted = false;
+            if (wasReady) {
+                this.emit(Events.LOADING_SCREEN, 0, 'WhatsApp');
+            }
+
             const isLogout =
                 frame.url().includes('post_logout=1') || this.lastLoggedOut;
 
             if (isLogout) {
-                this._appStateSyncPromise = null;
-                this._readyEmitted = false;
                 this.emit(Events.DISCONNECTED, 'LOGOUT');
                 await this.authStrategy.logout();
                 await this.authStrategy.beforeBrowserInitialized();
@@ -590,13 +616,17 @@ class Client extends EventEmitter {
                 this.lastLoggedOut = false;
             }
 
-            const storeAvailable = await this.pupPage.evaluate(() => {
-                return typeof window.WWebJS !== 'undefined';
-            });
-
-            if (!isLogout && storeAvailable) return;
-
-            await this.inject();
+            try {
+                await this.inject();
+            } catch (error) {
+                if (
+                    this.pupPage?.isClosed?.() ||
+                    this.pupBrowser?.isConnected?.() === false
+                ) {
+                    return;
+                }
+                throw error;
+            }
         });
     }
 
@@ -1655,16 +1685,17 @@ class Client extends EventEmitter {
         try {
             sentMsg = await evaluateSendMessage();
         } catch (err) {
-            if (!/detached Frame/i.test(err?.message ?? '')) throw err;
+            if (!isTransientNavigationError(err)) throw err;
             // WhatsApp Web reloaded its page (e.g. on reconnect) exactly
             // while this evaluate() was in flight, detaching the frame it
             // targeted. Wait for the framenavigated handler's re-injection
             // to finish, then retry once against the fresh frame.
-            await this.pupPage
-                .waitForFunction('typeof window.WWebJS !== "undefined"', {
-                    timeout: this.options.authTimeoutMs || 30000,
-                })
-                .catch(() => {});
+            const recovered = await this._pollPage(
+                () => typeof window.WWebJS !== 'undefined',
+                new AbortController().signal,
+                this.options.authTimeoutMs || 30000,
+            );
+            if (!recovered) throw err;
             sentMsg = await evaluateSendMessage();
         }
 
