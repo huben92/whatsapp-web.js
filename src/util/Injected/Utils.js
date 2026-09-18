@@ -483,6 +483,10 @@ exports.LoadUtils = () => {
             ...extraOptions,
         };
 
+        // MediaData is a model with an enumerable private ID. Spreading it
+        // into a Msg would replace the MsgKey's backing ID with the media ID.
+        delete message.__x_id;
+
         // Bot's won't reply if canonicalUrl is set (linking)
         if (botOptions) {
             delete message.canonicalUrl;
